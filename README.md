@@ -2,6 +2,7 @@
 
 GitHub Wiki를 자동으로 클론하고, 여러 .md 파일을 단일 Markdown 문서로 통합합니다.
 내부 Wiki 링크를 문서 내부 앵커(`#anchor`)로 자동 변환합니다.
+병합된 .md를 TOC 포함 HTML로 변환하고, PDF로 출력합니다.
 
 ```
 $ wikicom clone https://github.com/user/repo.wiki.git
@@ -27,7 +28,8 @@ $ wikicom wikispace/repo.wiki
 ### Option A — Python 스크립트로 직접 실행
 
 ```
-pip install pyyaml
+pip install pyyaml markdown playwright
+playwright install chromium
 python wikicom.py clone https://github.com/user/repo.wiki.git
 ```
 
@@ -46,7 +48,10 @@ build.bat
 
 ```
 wikicom clone <url> [--dir DIR]
+wikicom pull <wiki-dir> [--force]
 wikicom [merge] <wiki-dir> [options]
+wikicom render [INPUT] [options]
+wikicom pdf [INPUT] [options]
 ```
 
 ### clone 옵션
@@ -56,21 +61,45 @@ wikicom [merge] <wiki-dir> [options]
 | `URL` | GitHub wiki clone URL (예: `https://github.com/user/repo.wiki.git`) |
 | `--dir DIR` | wikispace 부모 디렉토리 (기본: `./wikispace`) |
 
+### pull 옵션
+
+| Option | Description |
+|--------|-------------|
+| `WIKI_DIR` | 업데이트할 wiki 클론 디렉토리 |
+| `--force` | 충돌 무시 후 원격 상태로 강제 동기화 (git fetch + reset --hard) |
+
 ### merge 옵션
 
-| Option | Short | Description |
-|--------|-------|-------------|
-| `WIKI_DIR` | | 클론된 wiki 디렉토리 (`merge` 키워드 생략 가능) |
-| `--output FILE` | `-o` | 출력 파일 경로 (기본: `mergespace/{wiki-folder-name}.md`) |
-| `--config FILE` | | `wikicom.yaml` 경로 명시 |
-| `--base-url URL` | | wiki 기준 URL (wikicom.yaml이 없을 때 필요) |
-| `--page-break STR` | | 파일 간 구분자 (기본: `---`, PDF용: `\newpage`) |
-| `--bump-headings` | | 헤딩 레벨 1 증가 (`#` → `##`) |
-| `--home FILE` | | 파일 순서 감지용 홈 파일 (기본: `Home.md`) |
-| `--no-auto-order` | | Home.md 기반 순서 감지 비활성화 (알파벳순) |
-| `--verbose` | | 링크 변환 내역 및 상세 출력 |
-| `--dry-run` | | 파일 쓰기 없이 stdout에 출력 |
-| `--version` | `-v` | 버전 출력 |
+| Option | Description |
+|--------|-------------|
+| `WIKI_DIR` | 클론된 wiki 디렉토리 (`merge` 키워드 생략 가능) |
+| `--output FILE` | 출력 파일 경로 (기본: `mergespace/{wiki-folder-name}.md`) |
+| `--config FILE` | `wikicom.yaml` 경로 명시 |
+| `--base-url URL` | wiki 기준 URL (wikicom.yaml이 없을 때 필요) |
+| `--page-break STR` | 파일 간 구분자 (기본: `---`, PDF용: `\newpage`) |
+| `--bump-headings` | 헤딩 레벨 1 증가 (`#` → `##`) |
+| `--home-file FILE` | 파일 순서 감지용 홈 파일 (기본: `Home.md`) |
+| `--no-auto-order` | Home.md 기반 순서 감지 비활성화 (알파벳순) |
+| `--verbose` | 링크 변환 내역 및 상세 출력 |
+| `--dry-run` | 파일 쓰기 없이 stdout에 출력 |
+
+### render 옵션
+
+| Option | Description |
+|--------|-------------|
+| `INPUT` | 변환할 .md 파일 또는 디렉토리 (기본: `./mergespace/`) |
+| `--output PATH` | 출력 경로 (기본: `./htmlspace/`) |
+| `--title TITLE` | HTML `<title>` 태그 내용 (기본: 파일명) |
+| `--css FILE` | 적용할 .css 파일 (기본: 내장 GitHub 스타일) |
+| `--no-toc` | 목차(TOC) 생성 비활성화 |
+
+### pdf 옵션
+
+| Option | Description |
+|--------|-------------|
+| `INPUT` | 변환할 .html 파일 또는 디렉토리 (기본: `./htmlspace/`) |
+| `--output PATH` | 출력 경로 (기본: `./pdfspace/`) |
+| `--format FORMAT` | 페이지 크기 (기본: `A4`, 예: `Letter`, `A3`) |
 
 ## Examples
 
@@ -80,6 +109,9 @@ wikicom clone https://github.com/user/repo.wiki.git
 
 # 다른 위치에 클론
 wikicom clone https://github.com/user/repo.wiki.git --dir ./docs
+
+# wiki 최신 상태로 업데이트
+wikicom pull wikispace/repo.wiki
 
 # 병합 (merge 키워드 생략 가능) → mergespace/repo.wiki.md 생성
 wikicom wikispace/repo.wiki
@@ -92,6 +124,18 @@ wikicom merge wikispace/repo.wiki --page-break "\\newpage" --bump-headings
 
 # 파일 쓰기 없이 결과 확인
 wikicom merge wikispace/repo.wiki --dry-run
+
+# 병합된 .md → HTML 변환
+wikicom render
+
+# HTML → PDF 변환
+wikicom pdf
+
+# 전체 워크플로우 (한 줄씩)
+wikicom clone https://github.com/user/repo.wiki.git
+wikicom merge wikispace/repo.wiki
+wikicom render
+wikicom pdf
 ```
 
 ---
@@ -101,7 +145,8 @@ wikicom merge wikispace/repo.wiki --dry-run
 1. **Clone** — wiki URL을 주면 자동으로 클론하고 `wikicom.yaml`을 생성합니다.
 2. **Edit** (선택) — `wikispace/repo.wiki/wikicom.yaml`을 열어 필요한 옵션을 수정합니다.
 3. **Merge** — 폴더 경로만 지정하면 yaml을 자동으로 찾아 병합을 실행합니다.
-4. **Output** — `mergespace/repo.wiki.md`가 생성됩니다.
+4. **Render** — 병합된 .md를 TOC 포함 HTML로 변환합니다.
+5. **PDF** — HTML을 PDF로 변환합니다.
 
 ```
 wikispace/
@@ -112,6 +157,12 @@ wikispace/
 
 mergespace/
 └── repo.wiki.md         ← merge 실행 후 생성
+
+htmlspace/
+└── repo.wiki.html       ← render 실행 후 생성
+
+pdfspace/
+└── repo.wiki.pdf        ← pdf 실행 후 생성
 ```
 
 ---

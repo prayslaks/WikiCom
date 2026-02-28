@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-wikicom — GitHub Wiki 클로너 & Markdown 병합기
+wikicom — GitHub Wiki 클로너 & Markdown 병합기 & HTML 렌더러
 
 GitHub Wiki를 자동으로 클론하고, 여러 .md 파일을 단일 .md 파일로 통합합니다.
 내부 Wiki 링크를 문서 내부 앵커(#anchor)로 자동 변환합니다.
+병합된 .md 파일을 TOC 포함 HTML로 변환합니다.
 
 Usage:
     wikicom clone <url> [--dir DIR]
     wikicom pull <wiki-dir> [--force]
     wikicom [merge] <wiki-dir> [options]
+    wikicom render [INPUT] [options]
+    wikicom pdf [INPUT] [options]
 
 Examples:
     wikicom clone https://github.com/user/repo.wiki.git
@@ -18,9 +21,16 @@ Examples:
     wikicom wikispace/repo.wiki
     wikicom merge wikispace/repo.wiki --output merged.md
     wikicom merge wikispace/repo.wiki --bump-headings --dry-run
+    wikicom render
+    wikicom render mergespace/repo.wiki.md
+    wikicom render mergespace/ --output htmlspace/
+    wikicom pdf
+    wikicom pdf htmlspace/repo.wiki.html
+    wikicom pdf htmlspace/ --output pdfspace/
 
 Dependencies:
-    pip install pyyaml
+    pip install pyyaml markdown playwright
+    playwright install chromium
 """
 
 import argparse
@@ -32,6 +42,85 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 VERSION = "1.0.0"
+
+SUBCOMMANDS = frozenset({'clone', 'merge', 'pull', 'render', 'pdf'})
+
+DEFAULT_CSS = """
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem;
+    line-height: 1.6;
+    color: #24292e;
+}
+img {
+    max-width: 100%;            /* 부모 너비를 절대 넘지 않음 */
+    height: auto;               /* 가로 세로 비율 유지 */
+    display: block;             /* 하단 여백 제거 및 레이아웃 안정화 */
+    page-break-inside: avoid;   /* 페이지 중간에서 이미지가 잘리는 것 방지 */
+}
+h1, h2, h3, h4, h5, h6 { margin-top: 1.5em; margin-bottom: 0.5em; }
+pre {
+    white-space: pre-wrap;       /* 공백 유지하며 줄바꿈 */
+    word-break: break-all;       /* 단어 단위와 상관없이 강제 줄바꿈 */
+    overflow-wrap: break-word;   /* 긴 단어도 줄바꿈 허용 */
+    background: #f6f8fa;
+    padding: 1em;
+    border-radius: 6px;
+    overflow-x: auto;
+}
+code { 
+    background: #f6f8fa; 
+    padding: 0.2em 0.4em; 
+    border-radius: 3px; 
+    font-size: 80%;
+    font-family: 'D2Coding', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-variant-ligatures: contextual; /* 합자 기능 활성화 */ 
+}
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #d1d5da; padding: 0.5em 1em; }
+th { background: #f6f8fa; }
+blockquote { margin: 0; padding: 0 1em; border-left: 4px solid #d1d5da; color: #6a737d; }
+hr { border: none; border-top: 1px solid #e1e4e8; margin: 2em 0; }
+a { color: #0366d6; }
+.toc { background: #f6f8fa; padding: 1em 1.5em; border-radius: 6px; margin-bottom: 2em; }
+.toc ul { margin: 0.3em 0; }
+.page-break { page-break-before: always; break-before: page; }
+.cover-page {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    page-break-after: always;
+    break-after: page;
+    padding: 4rem 2rem;
+}
+.cover-page h1 { font-size: 2.5em; margin: 0 0 0.5em; border-bottom: none; }
+.cover-page p  { color: #6a737d; margin: 0.3em 0; }
+"""
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+_warnings: List[str] = []
+
+
+def _warn(message: str) -> None:
+    """경고를 stderr에 출력하고 목록에 기록합니다."""
+    full = f"WARNING: {message}"
+    print(full, file=sys.stderr)
+    _warnings.append(full)
+
+
+def _error(message: str) -> None:
+    """오류를 stderr에 출력하고 종료합니다."""
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +176,7 @@ DEFAULT_CONFIG = {
     'bump_headings': False,
     'exclude': [],
     'per_file': {},
+    'cover': None,            # None → 표지 미생성
 }
 
 
@@ -128,8 +218,8 @@ def load_config(wiki_dir: Path, cli_args) -> dict:
         cfg['page_break'] = cli_args.page_break
     if getattr(cli_args, 'bump_headings', False):
         cfg['bump_headings'] = True
-    if getattr(cli_args, 'home', None):
-        cfg['home_file'] = cli_args.home
+    if getattr(cli_args, 'home_file', None):
+        cfg['home_file'] = cli_args.home_file
     if getattr(cli_args, 'no_auto_order', False):
         cfg['no_auto_order'] = True
 
@@ -448,6 +538,39 @@ def process_page(
 
 
 # ---------------------------------------------------------------------------
+# Cover Page
+# ---------------------------------------------------------------------------
+
+def _build_cover_block(config: dict, wiki_dir: Path) -> str:
+    """
+    wikicom.yaml의 cover 설정으로 HTML cover block 문자열을 생성합니다.
+    cover 설정이 없으면 빈 문자열을 반환합니다.
+
+    생성된 블록은 <div class="cover-page">...</div> 형태로,
+    merged .md 맨 앞에 삽입되며 Python-Markdown extra 확장의
+    HTML passthrough로 그대로 렌더됩니다.
+    """
+    cover = config.get('cover')
+    if not cover:
+        return ''
+
+    title    = cover.get('title') or re.sub(r'\.wiki$', '', wiki_dir.name)
+    subtitle = cover.get('subtitle', '')
+    author   = cover.get('author', '')
+    version  = cover.get('version', '')
+    date     = cover.get('date', '')
+
+    lines = [f'\n\n# {title}\n']
+    if subtitle:
+        lines.append(f'\n**{subtitle}**\n')
+    meta = ' &nbsp;|&nbsp; '.join(filter(None, [author, version, date]))
+    if meta:
+        lines.append(f'\n{meta}\n')
+        
+    return ''.join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
 
@@ -471,26 +594,6 @@ def assemble(
 
 
 # ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-_warnings: List[str] = []
-
-
-def _warn(message: str) -> None:
-    """경고를 stderr에 출력하고 목록에 기록합니다."""
-    full = f"WARNING: {message}"
-    print(full, file=sys.stderr)
-    _warnings.append(full)
-
-
-def _error(message: str) -> None:
-    """오류를 stderr에 출력하고 종료합니다."""
-    print(f"Error: {message}", file=sys.stderr)
-    sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
 # Clone Command
 # ---------------------------------------------------------------------------
 
@@ -506,6 +609,7 @@ def parse_wiki_url(url: str) -> dict:
             "repo_wiki_name": "repo.wiki",
             "user":           "user",
             "repo":           "repo",
+            "internal":       "./wikispace/user.repo.wiki",
         }
     """
     m = re.match(r'^https://github\.com/([^/]+)/([^/]+)\.wiki\.git$', url)
@@ -518,7 +622,7 @@ def parse_wiki_url(url: str) -> dict:
     return {
         "base_url":       f"https://github.com/{user}/{repo}/wiki",
         "clone_url":      url,
-        "repo_wiki_name": f"{repo}.wiki",
+        "repo_wiki_name": f"{user}.{repo}.wiki",
         "user":           user,
         "repo":           repo,
     }
@@ -577,6 +681,14 @@ exclude: []
 #   Page-Name.md:
 #     inject_heading: "# Page Title"   # 레벨-1 헤딩이 없는 파일에 삽입
 #     bump_headings: true              # 이 파일만 헤딩 레벨 증가
+
+# 표지 설정 (없으면 표지 미생성)
+# cover:
+#   title: "My Project"              # 없으면 wiki 폴더명에서 자동 추출
+#   subtitle: "v1.0 Documentation"
+#   author: "Author Name"
+#   version: "1.0.0"
+#   date: "2026-02-28"
 """
     yaml_path.write_text(content, encoding='utf-8')
 
@@ -615,7 +727,7 @@ def cmd_clone(args) -> None:
 
     url_info = parse_wiki_url(args.url)
 
-    wikispace_dir = Path(args.dir).resolve() if args.dir else Path('wikispace').resolve()
+    wikispace_dir = Path(args.dir).resolve() if args.dir else Path('wikispace').resolve()    
     target_dir = wikispace_dir / url_info['repo_wiki_name']
 
     if target_dir.exists() and any(target_dir.iterdir()):
@@ -703,6 +815,200 @@ def cmd_pull(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Render Command
+# ---------------------------------------------------------------------------
+
+def _ensure_heading_ids(body: str) -> str:
+    """
+    id 없는 헤딩 요소에 heading_to_anchor 기준 id를 삽입합니다.
+
+    toc 확장 미사용(--no-toc) 시에도 앵커 링크 타깃이 유효하도록 보완합니다.
+    이미 id가 있는 헤딩은 건드리지 않습니다.
+    중복 헤딩 텍스트는 -1, -2, ... 접미사로 구분합니다.
+    """
+    seen: Dict[str, int] = {}
+
+    def add_id(m: re.Match) -> str:
+        tag = m.group(1)    # 'h1', 'h2', ...
+        attrs = m.group(2)  # 기존 속성 문자열 (공백 포함, 없으면 '')
+        inner = m.group(3)  # 내부 HTML
+
+        if 'id=' in attrs:
+            return m.group(0)
+
+        plain = re.sub(r'<[^>]+>', '', inner)
+        base = heading_to_anchor(plain)
+        if not base:
+            return m.group(0)
+
+        count = seen.get(base, 0)
+        anchor = base if count == 0 else f'{base}-{count}'
+        seen[base] = count + 1
+
+        return f'<{tag}{attrs} id="{anchor}">{inner}</{tag}>'
+
+    return re.sub(r'<(h[1-6])([^>]*)>(.*?)</\1>', add_id, body, flags=re.DOTALL)
+
+
+def render_md_to_html(
+    md_path: Path,
+    output_path: Path,
+    title: Optional[str],
+    css: str,
+    include_toc: bool,
+) -> None:
+    """단일 .md 파일을 HTML로 변환하여 output_path에 저장합니다."""
+    import markdown as md_lib  # lazy import (선택적 의존성)
+
+    text = md_path.read_text(encoding='utf-8')
+    # Python-Markdown은 CommonMark와 달리 1~3칸 들여쓰기 ATX 헤딩을 인식하지 못합니다.
+    # 들여쓰기를 제거하여 헤딩이 올바르게 변환되도록 정규화합니다.
+    text = re.sub(r'^( {1,3})(#{1,6}(?:[ \t]|$))', r'\2', text, flags=re.MULTILINE)
+    extensions = ['extra', 'toc', 'attr_list'] if include_toc else ['extra']
+    md = md_lib.Markdown(
+        extensions=extensions,
+        extension_configs={'toc': {'toc_depth': '1-3'}},
+    )
+    body = md.convert(text)
+    body = _ensure_heading_ids(body)
+
+    # 두 번째 <h1>부터 앞에 page-break div 삽입 (첫 번째는 건너뜀)
+    _first = [True]
+
+    def _insert_page_break(m: re.Match) -> str:
+        if _first:
+            _first.pop()
+            return m.group(0)
+        return '<div class="page-break"></div>\n' + m.group(0)
+
+    body = re.sub(r'<h1(?=[\s>])', _insert_page_break, body)
+
+    toc_html = ''
+    if include_toc and '<li>' in getattr(md, 'toc', ''):
+        toc_html = f'<nav class="toc">\n{md.toc}\n</nav>\n'
+
+    if title is None:
+        title = md_path.stem
+
+    html = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>{css}</style>
+</head>
+<body>
+{toc_html}{body}
+</body>
+</html>"""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html, encoding='utf-8')
+
+
+def cmd_render(args) -> None:
+    """wikicom render [INPUT] [options] 실행."""
+    try:
+        import markdown as _  # noqa: F401
+    except ImportError:
+        _error("markdown 패키지가 설치되어 있지 않습니다. 'pip install markdown' 실행 후 재시도하세요.")
+
+    input_path = Path(args.input).resolve() if args.input else Path.cwd() / 'mergespace'
+
+    css = DEFAULT_CSS
+    if args.css:
+        css_file = Path(args.css)
+        if not css_file.exists():
+            _error(f"CSS 파일을 찾을 수 없습니다: {css_file}")
+        css = css_file.read_text(encoding='utf-8')
+
+    include_toc = not getattr(args, 'no_toc', False)
+    title = getattr(args, 'title', None)
+
+    if input_path.is_file():
+        if input_path.suffix.lower() != '.md':
+            _error(f"입력 파일이 .md 형식이 아닙니다: {input_path}")
+        output_path = Path(args.output) if args.output else (
+            Path.cwd() / 'htmlspace' / input_path.with_suffix('.html').name
+        )
+        render_md_to_html(input_path, output_path, title, css, include_toc)
+        print(f"완료: {input_path.name} → {output_path}")
+
+    elif input_path.is_dir():
+        md_files = sorted(input_path.glob('*.md'))
+        if not md_files:
+            _error(f"{input_path} 에서 .md 파일을 찾을 수 없습니다.")
+        output_dir = Path(args.output) if args.output else Path.cwd() / 'htmlspace'
+        for md_file in md_files:
+            out = output_dir / md_file.with_suffix('.html').name
+            render_md_to_html(md_file, out, title or md_file.stem, css, include_toc)
+        print(f"완료: {len(md_files)}개 파일 → {output_dir}")
+
+    else:
+        _error(f"경로가 존재하지 않습니다: {input_path}")
+
+
+# ---------------------------------------------------------------------------
+# PDF Command
+# ---------------------------------------------------------------------------
+
+def _html_to_pdf(html_path: Path, output_path: Path, fmt: str, margins: dict) -> None:
+    """Playwright Chromium으로 로컬 HTML 파일을 PDF로 변환합니다."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _error(
+            "playwright가 설치되어 있지 않습니다.\n"
+            "  pip install playwright && playwright install chromium"
+        )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(html_path.as_uri(), wait_until="networkidle")
+        page.pdf(
+            path=str(output_path),
+            format=fmt,
+            print_background=True,
+            prefer_css_page_size=True,
+            margin=margins,
+        )
+        browser.close()
+
+
+def cmd_pdf(args) -> None:
+    """wikicom pdf [INPUT] [options] 실행."""
+    input_path = Path(args.input).resolve() if args.input else Path.cwd() / 'htmlspace'
+    fmt = args.format
+    margins = {"top": "20px", "bottom": "20px", "left": "20px", "right": "20px"}
+
+    if input_path.is_file():
+        if input_path.suffix.lower() != '.html':
+            _error(f"입력 파일이 .html 형식이 아닙니다: {input_path}")
+        output_path = Path(args.output) if args.output else (
+            Path.cwd() / 'pdfspace' / input_path.with_suffix('.pdf').name
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _html_to_pdf(input_path, output_path, fmt, margins)
+        print(f"완료: {input_path.name} → {output_path}")
+
+    elif input_path.is_dir():
+        html_files = sorted(input_path.glob('*.html'))
+        if not html_files:
+            _error(f"{input_path} 에서 .html 파일을 찾을 수 없습니다.")
+        output_dir = Path(args.output) if args.output else Path.cwd() / 'pdfspace'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for html_file in html_files:
+            out = output_dir / html_file.with_suffix('.pdf').name
+            _html_to_pdf(html_file, out, fmt, margins)
+        print(f"완료: {len(html_files)}개 파일 → {output_dir}")
+
+    else:
+        _error(f"경로가 존재하지 않습니다: {input_path}")
+
+
+# ---------------------------------------------------------------------------
 # Merge Command
 # ---------------------------------------------------------------------------
 
@@ -738,7 +1044,7 @@ def cmd_merge(args) -> None:
     explicit_files = config.get('files')
     if explicit_files:
         ordered = resolve_explicit_order(explicit_files, pages, wiki_dir)
-    elif getattr(args, 'no_auto_order', False) or config.get('no_auto_order'):
+    elif config.get('no_auto_order'):
         ordered = sorted(pages, key=lambda p: p.filename.lower())
         if verbose:
             print("파일 순서 (알파벳순):")
@@ -755,6 +1061,10 @@ def cmd_merge(args) -> None:
 
     merged = assemble(ordered, config, slug_anchor_map, verbose=verbose)
 
+    cover = _build_cover_block(config, wiki_dir)
+    if cover:
+        merged = cover + '\n\n' + merged
+
     if args.dry_run:
         sys.stdout.buffer.write(merged.encode('utf-8'))
     else:
@@ -770,7 +1080,202 @@ def cmd_merge(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI — Subparser Builders
+# ---------------------------------------------------------------------------
+
+
+def _add_clone_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        'clone',
+        help='GitHub wiki를 클론하고 wikicom.yaml을 자동 생성합니다',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  wikicom clone https://github.com/user/repo.wiki.git\n"
+            "  wikicom clone https://github.com/user/repo.wiki.git --dir ./myspace\n"
+        ),
+    )
+    p.add_argument(
+        'url',
+        metavar='URL',
+        help='GitHub wiki clone URL (예: https://github.com/user/repo.wiki.git)',
+    )
+    p.add_argument(
+        '--dir',
+        metavar='DIR',
+        default=None,
+        help='wikispace 부모 디렉토리 (기본: ./wikispace)',
+    )
+    p.set_defaults(func=cmd_clone)
+
+
+def _add_pull_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        'pull',
+        help='wiki를 원격 최신 상태로 업데이트합니다',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  wikicom pull wikispace/repo.wiki\n"
+            "  wikicom pull wikispace/repo.wiki --force\n"
+        ),
+    )
+    p.add_argument(
+        'wiki_dir',
+        metavar='WIKI_DIR',
+        help='업데이트할 wiki 클론 디렉토리',
+    )
+    p.add_argument(
+        '--force',
+        action='store_true',
+        help='충돌 무시 후 원격 상태로 강제 동기화 (git fetch + reset --hard)',
+    )
+    p.set_defaults(func=cmd_pull)
+
+
+def _add_merge_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        'merge',
+        help='wiki .md 파일들을 단일 문서로 병합합니다',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  wikicom merge wikispace/repo.wiki\n"
+            "  wikicom merge wikispace/repo.wiki --output out.md\n"
+            "  wikicom merge wikispace/repo.wiki --bump-headings --dry-run\n"
+        ),
+    )
+    p.add_argument(
+        'wiki_dir',
+        metavar='WIKI_DIR',
+        help='.md 파일이 있는 wiki 클론 디렉토리',
+    )
+    p.add_argument(
+        '--base-url',
+        metavar='URL',
+        help='Wiki 기준 URL (wikicom.yaml이 없을 때 필요)',
+    )
+    p.add_argument(
+        '--output',
+        metavar='FILE',
+        help='출력 .md 파일 경로 (기본: mergespace/{wiki-folder-name}.md)',
+    )
+    p.add_argument(
+        '--config',
+        metavar='FILE',
+        help='wikicom.yaml 경로 명시',
+    )
+    p.add_argument(
+        '--page-break',
+        metavar='STR',
+        help=r'파일 간 구분자 (기본: \n\n---\n\n, PDF용: \\newpage)',
+    )
+    p.add_argument(
+        '--bump-headings',
+        action='store_true',
+        help='헤딩 레벨을 1 증가 (# → ##, ## → ###, ...)',
+    )
+    p.add_argument(
+        '--home-file',
+        metavar='FILE',
+        help='파일 순서 자동 감지용 홈 파일 (기본: Home.md)',
+    )
+    p.add_argument(
+        '--no-auto-order',
+        action='store_true',
+        help='Home.md 기반 자동 순서 감지 비활성화 (알파벳순)',
+    )
+    p.add_argument(
+        '--verbose',
+        action='store_true',
+        help='링크 변환 내역 및 처리 상세 출력',
+    )
+    p.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='파일 쓰기 없이 결과를 stdout에 출력',
+    )
+    p.set_defaults(func=cmd_merge)
+
+
+def _add_render_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        'render',
+        help='.md 파일을 HTML로 변환합니다',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  wikicom render\n"
+            "  wikicom render mergespace/repo.wiki.md\n"
+            "  wikicom render mergespace/ --output htmlspace/\n"
+            "  wikicom render input.md --title 'My Doc' --no-toc\n"
+        ),
+    )
+    p.add_argument(
+        'input',
+        metavar='INPUT',
+        nargs='?',
+        default=None,
+        help='변환할 .md 파일 또는 디렉토리 (기본: ./mergespace/)',
+    )
+    p.add_argument(
+        '--output',
+        metavar='PATH',
+        help='출력 .html 파일 또는 디렉토리 경로 (기본: ./htmlspace/)',
+    )
+    p.add_argument(
+        '--title',
+        metavar='TITLE',
+        help='HTML <title> 태그 내용 (기본: 파일명)',
+    )
+    p.add_argument(
+        '--css',
+        metavar='FILE',
+        help='적용할 .css 파일 경로 (기본: 내장 GitHub 스타일)',
+    )
+    p.add_argument(
+        '--no-toc',
+        action='store_true',
+        help='목차(TOC) 생성 비활성화',
+    )
+    p.set_defaults(func=cmd_render)
+
+
+def _add_pdf_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        'pdf',
+        help='HTML을 PDF로 변환합니다 (Playwright 필요)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  wikicom pdf\n"
+            "  wikicom pdf htmlspace/repo.wiki.html\n"
+            "  wikicom pdf htmlspace/ --output pdfspace/\n"
+        ),
+    )
+    p.add_argument(
+        'input',
+        metavar='INPUT',
+        nargs='?',
+        default=None,
+        help='변환할 .html 파일 또는 디렉토리 (기본: ./htmlspace/)',
+    )
+    p.add_argument(
+        '--output',
+        metavar='PATH',
+        help='출력 .pdf 파일 또는 디렉토리 경로 (기본: ./pdfspace/)',
+    )
+    p.add_argument(
+        '--format',
+        metavar='FORMAT',
+        default='A4',
+        help='페이지 크기 (기본: A4, 예: Letter, A3)',
+    )
+    p.set_defaults(func=cmd_pdf)
+
+
+# ---------------------------------------------------------------------------
+# CLI — Entry Point
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -787,10 +1292,12 @@ def build_parser() -> argparse.ArgumentParser:
             "  wikicom wikispace/repo.wiki\n"
             "  wikicom merge wikispace/repo.wiki --output out.md\n"
             "  wikicom merge wikispace/repo.wiki --bump-headings --dry-run\n"
+            "  wikicom render\n"
+            "  wikicom render mergespace/repo.wiki.md\n"
         ),
     )
     parser.add_argument(
-        '--version', '-v',
+        '--version',
         action='version',
         version=f'wikicom {VERSION}',
     )
@@ -798,123 +1305,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest='command')
     subparsers.required = True
 
-    # --- clone ---
-    clone_p = subparsers.add_parser(
-        'clone',
-        help='GitHub wiki를 클론하고 wikicom.yaml을 자동 생성합니다',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "examples:\n"
-            "  wikicom clone https://github.com/user/repo.wiki.git\n"
-            "  wikicom clone https://github.com/user/repo.wiki.git --dir ./myspace\n"
-        ),
-    )
-    clone_p.add_argument(
-        'url',
-        metavar='URL',
-        help='GitHub wiki clone URL (예: https://github.com/user/repo.wiki.git)',
-    )
-    clone_p.add_argument(
-        '--dir',
-        metavar='DIR',
-        default=None,
-        help='wikispace 부모 디렉토리 (기본: ./wikispace)',
-    )
-    clone_p.set_defaults(func=cmd_clone)
-
-    # --- pull ---
-    pull_p = subparsers.add_parser(
-        'pull',
-        help='wiki를 원격 최신 상태로 업데이트합니다',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "examples:\n"
-            "  wikicom pull wikispace/repo.wiki\n"
-            "  wikicom pull wikispace/repo.wiki --force\n"
-        ),
-    )
-    pull_p.add_argument(
-        'wiki_dir',
-        metavar='WIKI_DIR',
-        help='업데이트할 wiki 클론 디렉토리',
-    )
-    pull_p.add_argument(
-        '--force', '-f',
-        action='store_true',
-        help='충돌 무시 후 원격 상태로 강제 동기화 (git fetch + reset --hard)',
-    )
-    pull_p.set_defaults(func=cmd_pull)
-
-    # --- merge ---
-    merge_p = subparsers.add_parser(
-        'merge',
-        help='wiki .md 파일들을 단일 문서로 병합합니다',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "examples:\n"
-            "  wikicom merge wikispace/repo.wiki\n"
-            "  wikicom merge wikispace/repo.wiki --output out.md\n"
-            "  wikicom merge wikispace/repo.wiki --bump-headings --dry-run\n"
-        ),
-    )
-    merge_p.add_argument(
-        'wiki_dir',
-        metavar='WIKI_DIR',
-        help='.md 파일이 있는 wiki 클론 디렉토리',
-    )
-    merge_p.add_argument(
-        '--base-url',
-        metavar='URL',
-        help='Wiki 기준 URL (wikicom.yaml이 없을 때 필요)',
-    )
-    merge_p.add_argument(
-        '--output', '-o',
-        metavar='FILE',
-        help='출력 .md 파일 경로 (기본: mergespace/{wiki-folder-name}.md)',
-    )
-    merge_p.add_argument(
-        '--config',
-        metavar='FILE',
-        help='wikicom.yaml 경로 명시',
-    )
-    merge_p.add_argument(
-        '--page-break',
-        metavar='STR',
-        help=r'파일 간 구분자 (기본: \n\n---\n\n, PDF용: \\newpage)',
-    )
-    merge_p.add_argument(
-        '--bump-headings',
-        action='store_true',
-        help='헤딩 레벨을 1 증가 (# → ##, ## → ###, ...)',
-    )
-    merge_p.add_argument(
-        '--home',
-        metavar='FILE',
-        help='파일 순서 자동 감지용 홈 파일 (기본: Home.md)',
-    )
-    merge_p.add_argument(
-        '--no-auto-order',
-        action='store_true',
-        help='Home.md 기반 자동 순서 감지 비활성화 (알파벳순)',
-    )
-    merge_p.add_argument(
-        '--verbose',
-        action='store_true',
-        help='링크 변환 내역 및 처리 상세 출력',
-    )
-    merge_p.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='파일 쓰기 없이 결과를 stdout에 출력',
-    )
-    merge_p.set_defaults(func=cmd_merge)
+    _add_clone_parser(subparsers)
+    _add_pull_parser(subparsers)
+    _add_merge_parser(subparsers)
+    _add_render_parser(subparsers)
+    _add_pdf_parser(subparsers)
 
     return parser
 
 
 def main() -> None:
-    SUBCOMMANDS = {'clone', 'merge', 'pull'}
-
     argv = sys.argv[1:]
 
     # 첫 번째 positional이 서브커맨드가 아니면 'merge'를 암묵적으로 삽입

@@ -9,3 +9,5 @@ __pycache__/
 # input/output
 wikispace/
 mergespace/
+htmlspace/
+pdfspace/
